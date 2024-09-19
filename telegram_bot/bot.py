@@ -1,11 +1,12 @@
-from telegram import Update, KeyboardButton, ReplyKeyboardMarkup, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import Updater, CommandHandler, MessageHandler, filters, CallbackContext, ConversationHandler
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import CallbackContext, ConversationHandler
 from django.conf import settings
-from .models import CustomUser, Teacher, Student, Course, Application, Topic
+from .models import CustomUser, Teacher, Application, Topic
 from django.db.models import Q
-import requests
+from django.core.mail import send_mail
+from django.conf import settings
 
-EMAIL, SEND_TEACHER_CHOICES, TEACHER_CALLBACK, SEND_TOPIC_CALLBACK, PROPOSE_TOPIC, CONFIRM_TOPIC, BUTTON_HANDLER = range(7)
+EMAIL, SEND_TEACHER_CHOICES, TEACHER_CALLBACK, SEND_TOPIC_CALLBACK, REJECT_REASON, PROPOSE_TOPIC, CONFIRM_TOPIC, BUTTON_HANDLER = range(8)
 
 def start(update: Update, context):
     update.message.reply_text("Пожалуйста, введите вашу почту.")
@@ -22,10 +23,8 @@ def process_email(update, context):
             update.message.reply_text(f"Здравствуйте, {custom_user.first_name}! Ожидайте заявок от студентов")
         elif custom_user.is_student:
             course = custom_user.student.course
-            # Найти всех преподавателей курса студента
             teachers = Teacher.objects.filter(courses=course).distinct()
 
-            # Создание кнопок для каждого преподавателя
             keyboard = []
             for teacher in teachers:
                 keyboard.append([
@@ -37,13 +36,13 @@ def process_email(update, context):
             return TEACHER_CALLBACK
     except:
             update.message.reply_text('Почта не найдена. Попробуйте снова')
+            return EMAIL
             
 def send_teacher_choices(update: Update, context):
     student = context.user_data['user']
     course = student.student.course
     teachers = Teacher.objects.filter(courses=course).distinct()
 
-    # Создание inline-кнопок для каждого преподавателя
     keyboard = []
     for teacher in teachers:
         keyboard.append([
@@ -84,7 +83,6 @@ def send_topic_callback(update: Update, context):
     query = update.callback_query
     query.answer()
 
-    # Получаем callback_data
     callback_data = query.data
 
     if callback_data.startswith('send_topic_'):
@@ -96,7 +94,6 @@ def send_topic_callback(update: Update, context):
 
             context.user_data['teacher'] = teacher
 
-            # Получить темы преподавателя
             topics = Topic.objects.filter(teacher=teacher)
             keyboard = []
             for topic in topics:
@@ -108,15 +105,13 @@ def send_topic_callback(update: Update, context):
             query = update.callback_query
             query.answer()
 
-            # Получаем ID темы
             topic_id = query.data.split('_')[2]
             topic = Topic.objects.get(id=topic_id)
             student = context.user_data['user'].student
 
-            # Создание заявки
             Application.objects.create(student=student, teacher=topic.teacher, topic=topic)
             teacher = CustomUser.objects.get(teacher=topic.teacher)
-            # Отправляем уведомление преподавателю на почту и в Telegram
+
             send_email_to_teacher(teacher, topic, context.user_data['user'])
             send_telegram_message(teacher, context.user_data['user'], topic, context)
 
@@ -142,19 +137,14 @@ def propose_topic(update: Update, context):
     topic = Topic.objects.create(name=topic, teacher=teacher)
     student = context.user_data['user'].student
 
-    # Создание заявки
     Application.objects.create(student=student, teacher=topic.teacher, topic=topic)
     teacher = CustomUser.objects.get(teacher=topic.teacher)
-    # Отправляем уведомление преподавателю на почту и в Telegram
+
     send_email_to_teacher(teacher, topic, context.user_data['user'])
     send_telegram_message(teacher, context.user_data['user'], topic, context)
 
     update.message.reply_text(f"Заявка на тему '{topic.name}' отправлена на рассмотрение.")
     return ConversationHandler.END
-
-
-from django.core.mail import send_mail
-from django.conf import settings
 
 def send_email_to_teacher(teacher, topic, student, proposed_topic=None):
     subject = f"Новая заявка от студента {student.first_name} {student.last_name}"
@@ -196,9 +186,7 @@ def button_handler(update: Update, context: CallbackContext):
     query = update.callback_query
     query.answer()
 
-    data = query.data  # Получаем callback_data
-
-    # Извлекаем ID студента и темы из callback_data
+    data = query.data 
     action, student_id, topic_id = data.split('_')
 
     if action == 'approve':
@@ -207,54 +195,55 @@ def button_handler(update: Update, context: CallbackContext):
         reject_request(student_id, topic_id, query, context)
 
 def approve_request(student_id, topic_id, query, context):
-    # Логика для одобрения заявки
-    # Например, обновляем статус в БД
+    application = Application.objects.get(student_id=student_id, topic_id=topic_id)
+    application.is_approved = True
+    application.save()
     query.edit_message_text(text="Заявка одобрена.")
     
-    # Отправляем сообщение студенту
     student = CustomUser.objects.get(id=student_id)
     context.bot.send_message(chat_id=student.telegram_chat_id, text="Ваша заявка была одобрена.")
 
-    # Отправляем уведомление по email
     send_email(student.email, "Ваша заявка одобрена")
 
 def reject_request(student_id, topic_id, query, context):
-    # Логика для отклонения заявки
-    # Например, показываем форму для ввода причины отклонения
-    query.edit_message_text(text="Заявка отклонена.")
-    
-    # Отправляем сообщение студенту
-    student = CustomUser.objects.get(id=student_id)
-    context.bot.send_message(chat_id=student.telegram_chat_id, text="Ваша заявка была отклонена.")
+    context.user_data['student_id'] = student_id
+    context.user_data['topic_id'] = topic_id
 
-    # Отправляем уведомление по email
-    send_email(student.email, "Ваша заявка отклонена")
+    query.edit_message_text(text="Пожалуйста, введите причину отклонения заявки:")
+    return REJECT_REASON
+
+def handle_reject_reason(update, context):
+    reason = update.message.text
+    student_id = context.user_data['student_id']
+    topic_id = context.user_data['topic_id']
+
+    application = Application.objects.get(student_id=student_id, topic_id=topic_id)
+    application.is_approved = False
+    application.rejection_reason = reason
+    application.save()
+
+    student = CustomUser.objects.get(id=student_id)
+    context.bot.send_message(chat_id=student.telegram_chat_id, text=f"Ваша заявка была отклонена. Причина: {reason}")
+
+    send_email(student.email, "Ваша заявка отклонена", f"Ваша заявка была отклонена. Причина: {reason}")
+
+    update.message.reply_text("Причина отказа была успешно отправлена студенту.")
+    return ConversationHandler.END
 
 def confirm_topic_callback(update, context):
     query = update.callback_query
     query.answer()
 
-    # Получаем ID темы
     topic_id = query.data.split('_')[2]
     topic = Topic.objects.get(id=topic_id)
     student = context.user_data['user'].student
 
-    # Создание заявки
     Application.objects.create(student=student, teacher=topic.teacher, topic=topic)
     teacher = CustomUser.objects.get(teacher=topic.teacher)
-    # Отправляем уведомление преподавателю на почту и в Telegram
+
     send_email_to_teacher(teacher, topic, context.user_data['user'])
     send_telegram_message(teacher, student, topic, context)
 
     query.edit_message_text(f"Заявка на тему '{topic.name}' отправлена на рассмотрение.")
 
-    return ConversationHandler.END
-
-def submit_proposed_topic(update, context):
-    proposed_topic = update.message.text
-    student = context.user_data['user']
-    instructor = Teacher.objects.get(id=context.user_data['teacher_id'])
-
-def stop(update: Update, context):
-    update.message.reply_text("Операция завершена.")
     return ConversationHandler.END
